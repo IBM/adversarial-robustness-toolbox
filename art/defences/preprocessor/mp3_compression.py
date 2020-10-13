@@ -103,13 +103,6 @@ class Mp3Compression(Preprocessor):
             """
             Apply MP3 compression to audio input of shape (samples, channel).
             """
-            # WARNING: Writing and reading MP3 from byte stream causes pydub to extend the original
-            # length. Writing and reading MP3 from local file system works without problems. It is
-            # easy to move from using BytesIO to local read/writes with the following:
-            # import os
-            # from art.config import ART_DATA_PATH
-            # tmp_wav = os.path.join(ART_DATA_PATH, "tmp.wav")
-            # tmp_mp3 = os.path.join(ART_DATA_PATH, "tmp.mp3")
             from pydub import AudioSegment
             from scipy.io.wavfile import write
 
@@ -129,12 +122,6 @@ class Mp3Compression(Preprocessor):
             tmp_wav.close()
             tmp_mp3.close()
             x_mp3 = np.array(audio_segment.get_array_of_samples()).reshape((-1, audio_segment.channels))
-            # WARNING: Due to above problem, we need to manually resize x_mp3 to original length.
-            x_mp3 = x_mp3[: x.shape[0]]
-
-            if normalized:
-                # x was normalized. Therefore normalizing x_mp3.
-                x_mp3 = x_mp3 * 2 ** -15
             return x_mp3
 
         if x.ndim != 3:
