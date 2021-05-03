@@ -18,7 +18,6 @@
 """
 This module implements the Threshold Attack and Pixel Attack.
 The Pixel Attack is a generalisation of One Pixel Attack.
-
 | One Pixel Attack Paper link:
     https://ieeexplore.ieee.org/abstract/document/8601309/citations#citations
     (arXiv link: https://arxiv.org/pdf/1710.08864.pdf)
@@ -39,6 +38,7 @@ import numpy as np
 # from scipy.optimize import differential_evolution
 # In the meantime, the modified implementation is used which is defined in the
 # lines `453-1457`.
+# Otherwise may use Tensorflow's implementation of DE.
 
 from six import string_types
 from scipy._lib._util import check_random_state
@@ -60,7 +60,6 @@ logger = logging.getLogger(__name__)
 class PixelThreshold(EvasionAttack):
     """
     These attacks were originally implemented by Vargas et al. (2019) & Su et al.(2019).
-
     | One Pixel Attack Paper link:
         https://ieeexplore.ieee.org/abstract/document/8601309/citations#citations
         (arXiv link: https://arxiv.org/pdf/1710.08864.pdf)
@@ -68,23 +67,25 @@ class PixelThreshold(EvasionAttack):
         https://arxiv.org/abs/1906.06026
     """
 
-    attack_params = EvasionAttack.attack_params + ["th", "es", "targeted", "verbose"]
+    attack_params = EvasionAttack.attack_params + ["th", "es", "max_iter", "targeted", "verbose", "verbose_es"]
     _estimator_requirements = (BaseEstimator, NeuralNetworkMixin, ClassifierMixin)
 
     def __init__(
         self,
         classifier: "CLASSIFIER_NEURALNETWORK_TYPE",
-        th: Optional[int],
-        es: int,
-        targeted: bool,
+        th: Optional[int] = None,
+        es: int = 0,
+        max_iter: int = 100,
+        targeted: bool = False,
         verbose: bool = True,
+        verbose_es: bool = False,
     ) -> None:
         """
         Create a :class:`.PixelThreshold` instance.
-
         :param classifier: A trained classifier.
         :param th: threshold value of the Pixel/ Threshold attack. th=None indicates finding a minimum threshold.
         :param es: Indicates whether the attack uses CMAES (0) or DE (1) as Evolutionary Strategy.
+        :param max_iter: Sets the Maximum iterations to run the Evolutionary Strategies for optimisation.
         :param targeted: Indicates whether the attack is targeted (True) or untargeted (False).
         :param verbose: Print verbose messages of ES and show progress bars.
         """
@@ -92,10 +93,12 @@ class PixelThreshold(EvasionAttack):
 
         self._project = True
         self.type_attack = -1
-        self.th = th  # pylint: disable=C0103
-        self.es = es  # pylint: disable=C0103
+        self.th = th
+        self.es = es
+        self.max_iter = max_iter
         self._targeted = targeted
         self.verbose = verbose
+        self.verbose_es = verbose_es
         PixelThreshold._check_params(self)
 
         if self.estimator.channels_first:
@@ -121,15 +124,12 @@ class PixelThreshold(EvasionAttack):
         if not isinstance(self.verbose, bool):
             raise ValueError("The flag `verbose` has to be of type bool.")
 
-        if not isinstance(self.verbose, bool):
+        if not isinstance(self.verbose_es, bool):
             raise ValueError("The argument `verbose` has to be of type bool.")
 
-    def generate(  # pylint: disable=W0221
-        self, x: np.ndarray, y: Optional[np.ndarray] = None, max_iter: int = 100, **kwargs
-    ) -> np.ndarray:
+    def generate(self, x: np.ndarray, y: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         """
         Generate adversarial samples and return them in an array.
-
         :param x: An array with the original inputs.
         :param y: Target values (class labels) one-hot-encoded of shape (nb_samples, nb_classes) or indices of shape
                   (nb_samples,). Only provide this parameter if you'd like to use true labels when crafting adversarial
@@ -149,43 +149,53 @@ class PixelThreshold(EvasionAttack):
                 y = np.argmax(y, axis=1)
 
         if self.th is None:
-            logger.info("Performing minimal perturbation Attack.")
+            logger.info(
+                "Performing minimal perturbation Attack. This takes substainally long time to process. For sanity check, pass th=10 to the Attack instance."
+            )
 
-        scale_input = bool(np.max(x) <= 1)
-
-        if scale_input:
-            x = x * 255.0
+        if np.max(x) <= 1:
+            raise ValueError(
+                "Processing Input in the float range of Pixels, Original Attacks were on Un-Processed Images and performance of evolutionary strategy substainally decreases if the input is in the float domain."
+            )
 
         adv_x_best = []
+        self.adv_th = []
         for image, target_class in tqdm(zip(x, y), desc="Pixel threshold", disable=not self.verbose):
+
             if self.th is None:
-                self.min_th = 127
+
+                min_th = -1
                 start, end = 1, 127
+
+                image_result = image
+
                 while True:
-                    image_result: Union[List[np.ndarray], np.ndarray] = []
+
                     threshold = (start + end) // 2
-                    success, trial_image_result = self._attack(image, target_class, threshold, max_iter)
-                    if image_result or success:
-                        image_result = trial_image_result
+                    success, trial_image_result = self._attack(image, target_class, threshold)
+
                     if success:
+                        image_result = trial_image_result
                         end = threshold - 1
+                        min_th = threshold
                     else:
                         start = threshold + 1
-                    if success:
-                        self.min_th = threshold
+
                     if end < start:
-                        if isinstance(image_result, list) and not image_result:
-                            # success = False
-                            image_result = image
                         break
+
+                self.adv_th = [min_th]
+
             else:
-                success, image_result = self._attack(image, target_class, self.th, max_iter)
+
+                success, image_result = self._attack(image, target_class, self.th)
+
+                if not success:
+                    image_result = image
+
             adv_x_best += [image_result]
 
         adv_x_best_array = np.array(adv_x_best)
-
-        if scale_input:
-            adv_x_best_array = adv_x_best_array / 255.0
 
         if y is not None:
             y = to_categorical(y, self.estimator.nb_classes)
@@ -236,9 +246,7 @@ class PixelThreshold(EvasionAttack):
             or (not self.targeted and predicted_class != target_class)
         )
 
-    def _attack(
-        self, image: np.ndarray, target_class: np.ndarray, limit: int, max_iter: int
-    ) -> Tuple[bool, np.ndarray]:
+    def _attack(self, image: np.ndarray, target_class: np.ndarray, limit: int) -> Tuple[bool, np.ndarray]:
         """
         Attack the given image `image` with the threshold `limit` for the `target_class` which is true label for
         untargeted attack and targeted label for targeted attack.
@@ -260,7 +268,7 @@ class PixelThreshold(EvasionAttack):
             from cma import CMAOptions
 
             opts = CMAOptions()
-            if not self.verbose:
+            if not self.verbose_es:
                 opts.set("verbose", -9)
                 opts.set("verb_disp", 40000)
                 opts.set("verb_log", 40000)
@@ -282,18 +290,19 @@ class PixelThreshold(EvasionAttack):
                     predict_fn,
                     maxfun=max(1, 400 // len(bounds)) * len(bounds) * 100,
                     callback=callback_fn,
-                    iterations=max_iter,
+                    iterations=self.max_iter,
                 )
-            except Exception as exception:  # pylint: disable=W0703
-                logger.info(exception)
+            except Exception as exception:
+                if self.verbose_es:
+                    print(exception)
 
             adv_x = strategy.result[0]
         else:
             strategy = differential_evolution(
                 predict_fn,
                 bounds,
-                disp=self.verbose,
-                maxiter=max_iter,
+                disp=self.verbose_es,
+                maxiter=self.max_iter,
                 popsize=max(1, 400 // len(bounds)),
                 recombination=1,
                 atol=-1,
@@ -312,7 +321,6 @@ class PixelAttack(PixelThreshold):
     """
     This attack was originally implemented by Vargas et al. (2019). It is generalisation of One Pixel Attack originally
     implemented by Su et al. (2019).
-
     | One Pixel Attack Paper link:
         https://ieeexplore.ieee.org/abstract/document/8601309/citations#citations
         (arXiv link: https://arxiv.org/pdf/1710.08864.pdf)
@@ -324,20 +332,21 @@ class PixelAttack(PixelThreshold):
         self,
         classifier: "CLASSIFIER_NEURALNETWORK_TYPE",
         th: Optional[int] = None,
-        es: int = 0,
+        es: int = 1,
+        max_iter: int = 100,
         targeted: bool = False,
         verbose: bool = False,
     ) -> None:
         """
         Create a :class:`.PixelAttack` instance.
-
         :param classifier: A trained classifier.
         :param th: threshold value of the Pixel/ Threshold attack. th=None indicates finding a minimum threshold.
         :param es: Indicates whether the attack uses CMAES (0) or DE (1) as Evolutionary Strategy.
+        :param max_iter: Sets the Maximum iterations to run the Evolutionary Strategies for optimisation.
         :param targeted: Indicates whether the attack is targeted (True) or untargeted (False).
         :param verbose: Indicates whether to print verbose messages of ES used.
         """
-        super().__init__(classifier, th, es, targeted, verbose)
+        super().__init__(classifier, th, es, max_iter, targeted, verbose)
         self.type_attack = 0
 
     def _perturb_image(self, x: np.ndarray, img: np.ndarray) -> np.ndarray:
@@ -395,7 +404,6 @@ class PixelAttack(PixelThreshold):
 class ThresholdAttack(PixelThreshold):
     """
     This attack was originally implemented by Vargas et al. (2019).
-
     | Paper link:
         https://arxiv.org/abs/1906.06026
     """
@@ -405,19 +413,20 @@ class ThresholdAttack(PixelThreshold):
         classifier: "CLASSIFIER_NEURALNETWORK_TYPE",
         th: Optional[int] = None,
         es: int = 0,
+        max_iter: int = 100,
         targeted: bool = False,
         verbose: bool = False,
     ) -> None:
         """
         Create a :class:`.PixelThreshold` instance.
-
         :param classifier: A trained classifier.
         :param th: threshold value of the Pixel/ Threshold attack. th=None indicates finding a minimum threshold.
         :param es: Indicates whether the attack uses CMAES (0) or DE (1) as Evolutionary Strategy.
+        :param max_iter: Sets the Maximum iterations to run the Evolutionary Strategies for optimisation.
         :param targeted: Indicates whether the attack is targeted (True) or untargeted (False).
         :param verbose: Indicates whether to print verbose messages of ES used.
         """
-        super().__init__(classifier, th, es, targeted, verbose)
+        super().__init__(classifier, th, es, max_iter, targeted, verbose)
         self.type_attack = 1
 
     def _perturb_image(self, x: np.ndarray, img: np.ndarray) -> np.ndarray:
@@ -448,9 +457,7 @@ A slight modification to Scipy's implementation of differential evolution.
 To speed up predictions, the entire parameters array is passed to `self.func`,
 where a neural network model can batch its computations and execute in parallel
 Search for `CHANGES` to find all code changes.
-
 Dan Kondratyuk 2018
-
 Original code adapted from
 https://github.com/scipy/scipy/blob/70e61dee181de23fdd8d893eaa9491100e2218d7/scipy/optimize/_differentialevolution.py
 ----------
